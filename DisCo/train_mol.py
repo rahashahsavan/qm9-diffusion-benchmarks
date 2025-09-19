@@ -1,4 +1,8 @@
 import os, sys
+import time
+import random
+import signal
+import yaml
 import pickle
 from tqdm import tqdm
 import numpy as np
@@ -38,6 +42,12 @@ seed_everything(seed)
 parser = argparse.ArgumentParser()
 
 """ ========================== General training settings ========================== """
+parser.add_argument('--checkpoint_dir', type=str, default='checkpoints/qm9')
+parser.add_argument('--autosave_minutes', type=int, default=0)
+parser.add_argument('--resume', action='store_true')
+parser.add_argument('--resume_from', type=str, default='')
+parser.add_argument('--config', type=str, default=None)
+parser.add_argument('--save_final_only', action='store_true')
 parser.add_argument('--batch_size', type=int, default=128)
 parser.add_argument('--epochs', type=int, default=3000,
                     help='Number of epochs to train.')
@@ -83,6 +93,19 @@ parser.add_argument('--global_fea', type=int, default=1,
                     help='Whether to use cycle and eigen global features.')
 args = parser.parse_args()
 
+# Optional: load YAML config and override checkpoint settings if provided
+def load_config(path):
+    if path is None or not os.path.isfile(path):
+        return {}
+    with open(path, 'r', encoding='utf-8') as f:
+        return yaml.safe_load(f) or {}
+
+cfg = load_config(args.config)
+checkpoint_dir = cfg.get('checkpointing', {}).get('checkpoint_dir', args.checkpoint_dir)
+autosave_minutes = cfg.get('checkpointing', {}).get('autosave_minutes', args.autosave_minutes)
+do_resume = cfg.get('checkpointing', {}).get('resume', args.resume)
+resume_from = cfg.get('checkpointing', {}).get('resume_from', args.resume_from)
+
 device = 'cpu' if args.device == 'cpu' else 'cuda:' + args.device
 BAR = True if args.BAR == 1 else False
 cycle_fea = True if args.cycle_fea == 1 else False
@@ -91,7 +114,52 @@ rwpe_fea = False
 global_fea = True if args.global_fea == 1 else False
 aux_feas = [cycle_fea, eigen_fea, rwpe_fea, global_fea]
 
+# Checkpoint utilities
+def save_checkpoint(state, checkpoint_dir, tag, keep_last_k=5):
+    os.makedirs(checkpoint_dir, exist_ok=True)
+    path = os.path.join(checkpoint_dir, f'ckpt_{tag}.pt')
+    torch.save(state, path)
+    all_ckpts = sorted([f for f in os.listdir(checkpoint_dir) if f.startswith('ckpt_') and f.endswith('.pt')])
+    if keep_last_k > 0 and len(all_ckpts) > keep_last_k:
+        for old in all_ckpts[:-keep_last_k]:
+            try:
+                os.remove(os.path.join(checkpoint_dir, old))
+            except OSError:
+                pass
+    return path
+
+def load_checkpoint(path, model, optimizer=None, scheduler=None, device='cpu'):
+    ckpt = torch.load(path, map_location=device)
+    model.load_state_dict(ckpt['model_state_dict'])
+    if optimizer is not None and 'optimizer_state_dict' in ckpt:
+        optimizer.load_state_dict(ckpt['optimizer_state_dict'])
+    if scheduler is not None and 'scheduler_state_dict' in ckpt and ckpt['scheduler_state_dict'] is not None:
+        scheduler.load_state_dict(ckpt['scheduler_state_dict'])
+    if 'rng' in ckpt:
+        random.setstate(ckpt['rng']['py_random'])
+        torch.set_rng_state(ckpt['rng']['torch'])
+        if torch.cuda.is_available() and ckpt['rng'].get('torch_cuda') is not None:
+            torch.cuda.set_rng_state_all(ckpt['rng']['torch_cuda'])
+    return ckpt
+
+def pack_state(model, optimizer, scheduler, epoch, global_step, extra=None):
+    return {
+        'epoch': epoch,
+        'global_step': global_step,
+        'time': time.time(),
+        'model_state_dict': model.state_dict(),
+        'optimizer_state_dict': optimizer.state_dict() if optimizer is not None else None,
+        'scheduler_state_dict': scheduler.state_dict() if scheduler is not None else None,
+        'rng': {
+            'py_random': random.getstate(),
+            'torch': torch.get_rng_state(),
+            'torch_cuda': torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None,
+        },
+        **(extra or {})
+    }
+
 def train(diffuser, model, optimizer, loader, stop_iter=None):
+    global global_step
     model.train()
     include_node_feature = diffuser.diffuse_node # this denotes whether to diffuse and reconstruct the raw node features
 
@@ -130,6 +198,7 @@ def train(diffuser, model, optimizer, loader, stop_iter=None):
         optimizer.zero_grad()
         loss.backward()
         optimizer.step()
+        global_step += 1
 
         if BAR:
             pbar.set_description("Loss E {:.3f}, Loss X {:.3f}".format(loss_E.item(), loss_X.item()))
@@ -312,11 +381,36 @@ sampler = TauLeaping(n_node_type,
 # print(E_qt0)
 # sys.exit()
 
+# Lightweight checkpointing state
+global_step = 0
+start_epoch = 0
+last_autosave = time.time()
+
+def _handle_sig(signum, frame):
+    state = pack_state(model, optimizer, scheduler, start_epoch, global_step, {'reason': 'signal'})
+    save_checkpoint(state, checkpoint_dir, f'interrupt_step{global_step}', keep_last_k=5)
+    raise SystemExit(0)
+
+signal.signal(signal.SIGINT, _handle_sig)
+signal.signal(signal.SIGTERM, _handle_sig)
+
+# Resume if requested
+if do_resume or (resume_from and os.path.isfile(resume_from)):
+    ckpt_path = resume_from
+    if not ckpt_path and os.path.isdir(checkpoint_dir):
+        candidates = sorted([os.path.join(checkpoint_dir, f) for f in os.listdir(checkpoint_dir) if f.endswith('.pt')])
+        ckpt_path = candidates[-1] if candidates else ''
+    if ckpt_path:
+        restored = load_checkpoint(ckpt_path, model, optimizer, scheduler, device=device)
+        start_epoch = int(restored.get('epoch', 0))
+        global_step = int(restored.get('global_step', 0))
+        print(f'[resume] Loaded {ckpt_path} epoch={start_epoch} step={global_step}')
+
 """ ========================== Main ========================== """
 sampling_metric = BasicMolecularMetrics(dataset_info, train_smiles)
 
 training_loss_min = 999
-for epoch in range(args.epochs):
+for epoch in range(start_epoch, args.epochs):
 
     train_nll = train(diffuser, model, optimizer, train_loader, stop_iter=100)
     # We report the test performance every 100 steps
@@ -347,7 +441,23 @@ for epoch in range(args.epochs):
 
     scheduler.step(train_nll)
 
+    # Save at end of epoch unless final-only is requested
+    if not args.save_final_only:
+        state = pack_state(model, optimizer, scheduler, epoch + 1, global_step, {'tag': 'epoch'})
+        save_checkpoint(state, checkpoint_dir, f'epoch{epoch+1}', keep_last_k=5)
+
+    # Autosave by wall-clock
+    if (not args.save_final_only) and autosave_minutes > 0 and (time.time() - last_autosave) >= autosave_minutes * 60:
+        state = pack_state(model, optimizer, scheduler, epoch + 1, global_step, {'tag': 'autosave'})
+        save_checkpoint(state, checkpoint_dir, f'autosave_step{global_step}', keep_last_k=5)
+        last_autosave = time.time()
+
     training_loss_min = min(training_loss_min, train_nll)
+
+# Save a single final checkpoint if requested
+if args.save_final_only:
+    state = pack_state(model, optimizer, scheduler, args.epochs, global_step, {'tag': 'final'})
+    save_checkpoint(state, checkpoint_dir, 'final', keep_last_k=1)
 
 if args.dataset != 'qm9':
     smile_list = []
